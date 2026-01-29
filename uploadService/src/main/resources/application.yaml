@@ -1,0 +1,39 @@
+server:
+  port: 8081 # Порт первого микросервиса
+
+spring:
+  application:
+    name: upload-service
+
+  r2dbc:
+    url: r2dbc:postgresql://localhost:5432/file_db
+    username: user
+    password: password
+
+  flyway:
+    url: jdbc:postgresql://localhost:5432/file_db
+    user: user
+    password: password
+    enabled: true
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+    properties:
+      spring.json.add.type.headers: false # Чтобы не было проблем с маппингом на стороне воркера
+
+  codec:
+    max-in-memory-size:
+
+app:
+  upload:
+    temp-path: /tmp/file-uploader/uploads
+
+    idempotency-ttl: 86400
