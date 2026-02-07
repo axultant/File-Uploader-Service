@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(.mvnw.cmd compile:*)",
-      "Bash(cmd /c \"mvnw.cmd compile -q\")"
-    ]
-  }
-}
