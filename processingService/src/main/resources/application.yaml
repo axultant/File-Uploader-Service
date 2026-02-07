@@ -1,3 +1,23 @@
+server:
+  port: 8082
+
 spring:
-  application:
-    name: processingService
+  r2dbc:
+    url: r2dbc:postgresql://localhost:5432/file_db
+    username: postgres
+    password: postgres
+  kafka:
+    bootstrap-servers: kafka:9092
+    consumer:
+      group-id: processing-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+app:
+  minio:
+    endpoint: http://minio:9000
+    access-key: admin
+    secret-key: password
+    bucket: uploads
+  temp-path: /tmp/file-uploader/uploads

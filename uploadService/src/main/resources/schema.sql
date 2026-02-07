@@ -1,5 +1,5 @@
 
-CREATE TABLE files (
+CREATE TABLE IF NOT EXISTS files (
                        id UUID PRIMARY KEY,
                        idempotency_key VARCHAR(255) UNIQUE NOT NULL,
                        filename VARCHAR(255) NOT NULL,
@@ -10,7 +10,7 @@ CREATE TABLE files (
                        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE outbox (
+CREATE TABLE IF NOT EXISTS outbox (
                         id BIGSERIAL PRIMARY KEY,
                         event_type VARCHAR(50) NOT NULL,
                         payload TEXT NOT NULL,
@@ -18,5 +18,5 @@ CREATE TABLE outbox (
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_files_idempotency ON files(idempotency_key);
-CREATE INDEX idx_outbox_status ON outbox(status) WHERE status = 'NEW';
+CREATE INDEX IF NOT EXISTS idx_files_idempotency ON files(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status) WHERE status = 'NEW';
