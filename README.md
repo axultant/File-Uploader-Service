@@ -1,181 +1,321 @@
-# File Uploader
+# RequestGuard
 
-Микросервисная система загрузки файлов с асинхронной обработкой через Kafka и хранением в MinIO.
+Микросервисная система модерации клиентских обращений с использованием Kafka, MongoDB и Redis.
 
 ## Архитектура
 
 ```
-Клиент (Postman)
-    |
-    v
-+------------------+     Kafka      +--------------------+     MinIO
-|  Upload Service  | ------------->| Processing Service  | ----------> S3-хранилище
-|     :8081        |               |      :8082          |
-+--------+---------+               +---------+----------+
-         |                                   |
-         +---------- PostgreSQL <------------+
-                       :5432
+                                    +------------------+
+                                    |     Service-2    |
+                                    |   (Data Service) |
+                                    |    Redis :8082   |
+                                    +--------^---------+
+                                             |
+                                             | REST API
+                                             | GET /api/clients/{id}
+                                             |
++----------+      +------------------+       |        +------------------+
+|  Kafka   |----->|    Service-1     |-------+------->|      Kafka       |
+| Topic-1  |      |   (Moderation)   |                |     Topic-2      |
+| (входящие|      | MongoDB :8081    |                | (одобренные      |
+| события) |      +------------------+                |  обращения)      |
++----------+                |                         +------------------+
+                            |
+                            v
+                    +---------------+
+                    |    MongoDB    |
+                    | (идемпотент-  |
+                    |  ность)       |
+                    +---------------+
 ```
 
 ### Стек технологий
 
-- **Java 21**, **Spring Boot 4.0.2**, **Spring WebFlux** (реактивный стек)
-- **R2DBC** — реактивный доступ к PostgreSQL
-- **Apache Kafka** (KRaft mode) — очередь событий
-- **MinIO** — S3-совместимое объектное хранилище
-- **Redis** — хранение ключей идемпотентности
-- **MapStruct** — маппинг DTO
+- **Java 17**, **Spring Boot 4.0.2**, **Spring WebFlux** (реактивный стек)
+- **Reactor Kafka** — реактивный Kafka consumer/producer
+- **Spring Data MongoDB Reactive** — реактивный доступ к MongoDB
+- **Spring Data Redis Reactive** — реактивный доступ к Redis
+- **Lombok** — сокращение boilerplate-кода
 - **Docker Compose** — оркестрация контейнеров
 
 ### Инфраструктура
 
-| Сервис     | Образ                  | Порт       | Назначение                        |
-|------------|------------------------|------------|-----------------------------------|
-| PostgreSQL | postgres:16-alpine     | 5432       | Общая БД для обоих сервисов       |
-| Redis      | redis:7-alpine         | 6379       | Ключи идемпотентности             |
-| Kafka      | apache/kafka:latest    | 9092       | Очередь событий                   |
-| MinIO      | minio/minio            | 9000, 9001 | Объектное хранилище (API, Console) |
-
-Сервисы связаны через Docker volume `shared_uploads` для передачи временных файлов.
+| Сервис   | Образ              | Порт  | Назначение                               |
+|----------|--------------------|-------|------------------------------------------|
+| Kafka    | apache/kafka:3.9.0 | 9092  | Очередь сообщений (KRaft mode, без Zookeeper) |
+| MongoDB  | mongo:7.0          | 27017 | Хранение обработанных событий            |
+| Redis    | redis:7-alpine     | 6379  | Кэш данных клиентов                     |
 
 ---
 
-## Upload Service (порт 8081)
+## Service-1: Moderation Service (порт 8081)
 
-Принимает файлы от клиента, сохраняет на диск и в БД, публикует событие через Outbox Pattern.
+Основной сервис модерации обращений. Реактивный (WebFlux + Reactor Kafka).
 
-### Endpoint
+Путь: `service-1-moderation/`
 
-```
-POST /api/v1/files/upload
-Content-Type: multipart/form-data
-Header: X-Idempotency-Key: <уникальный ключ>
-Body: file=<файл>
-```
+| Компонент              | Файл                                  | Описание                                              |
+|------------------------|---------------------------------------|-------------------------------------------------------|
+| KafkaConsumerService   | service/KafkaConsumerService.java     | Слушает topic-1, передаёт события на обработку        |
+| ModerationService      | service/ModerationService.java        | Оркестратор: идемпотентность -> обогащение -> правила -> публикация |
+| EnrichmentService      | service/EnrichmentService.java        | Вызывает Service-2 для получения данных клиента       |
+| ModerationRulesService | service/ModerationRulesService.java   | Бизнес-правила модерации                              |
+| KafkaProducerService   | service/KafkaProducerService.java     | Отправляет одобренные обращения в topic-2             |
+| ModerationController   | controller/ModerationController.java  | REST API для тестирования (POST /api/moderation/send) |
+| ProcessedEvent         | model/ProcessedEvent.java             | MongoDB-документ для хранения обработанных событий    |
 
-Ответ (HTTP 202):
-```json
-{
-  "fileId": "uuid",
-  "filename": "example.txt",
-  "status": "PENDING",
-  "message": null,
-  "timestamp": "2026-02-02T11:41:00Z"
+---
+
+## Service-2: Data Service (порт 8082)
+
+Сервис данных клиентов. Хранит информацию в Redis.
+
+Путь: `service-2-data/`
+
+| Компонент            | Файл                                 | Описание                        |
+|----------------------|--------------------------------------|---------------------------------|
+| ClientDataController | controller/ClientDataController.java | REST API: GET/POST /api/clients |
+| ClientDataService    | service/ClientDataService.java       | CRUD операции с Redis           |
+
+---
+
+## Поток обработки события
+
+### 1. Получение события (KafkaConsumerService)
+
+```java
+@PostConstruct
+public void startConsuming() {
+    KafkaReceiver.create(receiverOptions)
+        .receive()
+        .flatMap(record -> moderationService.processEvent(record.value())
+            .doOnSuccess(v -> record.receiverOffset().acknowledge())
+        )
+        .subscribe();
 }
 ```
 
-### Структура
+- Consumer стартует при запуске приложения (`@PostConstruct`)
+- События обрабатываются параллельно (`flatMap`, до 256 одновременно)
+- Offset подтверждается только после успешной обработки
+- При ошибке — событие будет переотправлено Kafka
 
-| Класс                    | Назначение                                                              |
-|--------------------------|-------------------------------------------------------------------------|
-| `FileUploadController`   | REST-контроллер, принимает multipart-запрос и заголовок идемпотентности  |
-| `UploadServiceImpl`      | Сохраняет файл на диск, записывает `FileEntity` и `OutboxEntity` в БД  |
-| `FileMapper`             | MapStruct-маппер: Request -> Entity -> Response -> Event                |
-| `OutboxRelay`            | Scheduler (каждые 5 сек), читает NEW записи из outbox, отправляет в Kafka |
-| `AppUploadProperties`    | Конфигурация: temp-path, idempotency-ttl                               |
-| `FileRepository`         | R2DBC-репозиторий для таблицы `files`                                   |
-| `OutboxRepository`       | R2DBC-репозиторий для таблицы `outbox`                                  |
+### 2. Проверка идемпотентности (ModerationService)
 
-### Модель данных
-
-**Таблица `files`:**
-
-| Поле              | Тип                      | Описание                   |
-|-------------------|--------------------------|----------------------------|
-| id                | UUID (PK)                | Уникальный ID файла        |
-| idempotency_key   | VARCHAR(255) UNIQUE      | Ключ идемпотентности       |
-| filename          | VARCHAR(255)             | Имя файла                  |
-| content_type      | VARCHAR(100)             | MIME-тип                   |
-| size              | BIGINT                   | Размер файла               |
-| status            | VARCHAR(20)              | PENDING / COMPLETED / FAILED |
-| storage_path      | VARCHAR(512)             | Путь к файлу (temp или minio://) |
-| created_at        | TIMESTAMP WITH TIME ZONE | Дата создания              |
-
-**Таблица `outbox`:**
-
-| Поле       | Тип                      | Описание                    |
-|------------|--------------------------|------------------------------|
-| id         | BIGSERIAL (PK)           | Auto-increment ID            |
-| event_type | VARCHAR(50)              | Тип события (FILE_UPLOADED)  |
-| payload    | TEXT                     | JSON с данными события       |
-| status     | VARCHAR(20)              | NEW / PROCESSED              |
-| created_at | TIMESTAMP WITH TIME ZONE | Дата создания                |
-
-### Outbox Pattern
-
-Вместо прямой отправки в Kafka из бизнес-логики, событие сначала сохраняется в таблицу `outbox` в одной транзакции с основными данными. Отдельный scheduler (`OutboxRelay`) периодически читает новые записи и отправляет их в Kafka. Это гарантирует доставку события даже при временной недоступности Kafka.
-
----
-
-## Processing Service (порт 8082)
-
-Слушает Kafka, загружает файлы из временного хранилища в MinIO, обновляет статус в БД.
-
-### Структура
-
-| Класс                   | Назначение                                                         |
-|-------------------------|--------------------------------------------------------------------|
-| `FileProcessingConsumer`| Kafka listener, оркестрирует обработку файла                       |
-| `MinioService`          | Загрузка файлов в MinIO (бакет создаётся автоматически)            |
-| `MinioConfig`           | Конфигурация MinioClient (endpoint, credentials)                   |
-| `FileRepository`        | R2DBC-репозиторий для обновления статуса файла                     |
-| `FileUploadedEvent`     | DTO входящего Kafka-события                                        |
-
-### Логика обработки
-
-1. Получает JSON-сообщение из topic `file-uploaded-topic`
-2. Десериализует в `FileUploadedEvent` (fileId, tempPath, filename, contentType, size)
-3. Читает файл по `tempPath` из shared volume
-4. Загружает в MinIO (bucket: `uploads`, object name: UUID)
-5. Обновляет `FileEntity` в БД: status -> `COMPLETED`, storagePath -> `minio://{uuid}`
-6. Удаляет временный файл с диска
-7. При ошибке: status -> `FAILED`
-
----
-
-## Жизненный цикл файла
-
+```java
+public Mono<Void> processEvent(RequestEvent event) {
+    return processedEventRepository.findByEventId(event.getEventId())
+        .hasElement()
+        .flatMap(alreadyProcessed -> {
+            if (alreadyProcessed) {
+                return Mono.empty(); // Пропускаем дубликат
+            }
+            return enrichAndModerate(event);
+        });
+}
 ```
-1.  POST /api/v1/files/upload + файл + X-Idempotency-Key
-2.  Файл записывается на диск: /tmp/file-uploader/uploads/{uuid}
-3.  FileEntity сохраняется в PostgreSQL (status: PENDING)
-4.  OutboxEntity сохраняется в PostgreSQL (status: NEW, payload: JSON)
-5.  HTTP 202 возвращается клиенту
-        --- асинхронно (каждые 5 сек) ---
-6.  OutboxRelay читает NEW-записи из outbox
-7.  Payload отправляется в Kafka topic "file-uploaded-topic"
-8.  Outbox status меняется на PROCESSED
-        --- в Processing Service ---
-9.  KafkaListener получает сообщение
-10. Файл с диска загружается в MinIO (bucket: uploads, object: uuid)
-11. FileEntity status -> COMPLETED, storagePath -> minio://uuid
-12. Временный файл удаляется
+
+- Проверка по `eventId` в MongoDB
+- Уникальный индекс на `eventId` гарантирует один вызов = одна запись
+
+### 3. Обогащение данными (EnrichmentService)
+
+```java
+public Mono<ClientInfo> getClientInfo(String clientId) {
+    return webClient.get()
+        .uri("/api/clients/{clientId}", clientId)
+        .retrieve()
+        .bodyToMono(ClientInfo.class)
+        .retryWhen(Retry.backoff(3, Duration.ofMillis(500)))
+        .onErrorResume(e -> Mono.just(new ClientInfo())); // Fallback
+}
+```
+
+- Запрос в Service-2 по REST
+- Retry с экспоненциальной задержкой (500ms, 1s, 2s)
+- При полной недоступности — возвращает пустой объект (обращение не блокируется)
+
+### 4. Применение правил модерации (ModerationRulesService)
+
+```java
+public String check(RequestEvent event, ClientInfo clientInfo) {
+    // Правило 1: Дубликат активного обращения
+    if (hasActiveRequestForSameTopic(event, clientInfo)) {
+        return "У клиента уже есть активное обращение...";
+    }
+
+    // Правило 2: Рабочее время для LOAN, CARD_ISSUE, MORTGAGE
+    if (isOutsideWorkingHours(event)) {
+        return "Обращение поступило вне рабочего времени...";
+    }
+
+    return null; // Все проверки пройдены
+}
+```
+
+Правила:
+
+| #  | Правило                           | Категории                  | Результат |
+|----|-----------------------------------|----------------------------|-----------|
+| 1  | Дубликат по category + topic      | Все                        | REJECTED  |
+| 2  | Вне рабочего времени (9:00-18:00) | LOAN, CARD_ISSUE, MORTGAGE | REJECTED  |
+
+### 5. Публикация результата
+
+Если **APPROVED**:
+
+```java
+return producerService.send(result)
+    .then(saveProcessedEvent(event, "APPROVED", null));
+```
+
+Если **REJECTED**:
+
+```java
+return saveProcessedEvent(event, "REJECTED", rejectReason);
+// В topic-2 НЕ отправляется!
+```
+
+---
+
+## Структура данных
+
+### RequestEvent (входящее событие)
+
+```json
+{
+    "eventId": "evt-123",
+    "clientId": "client-1",
+    "category": "LOAN",
+    "topic": "Досрочное погашение",
+    "message": "Хочу погасить кредит досрочно",
+    "timestamp": "2024-02-05T14:30:00"
+}
+```
+
+### ClientInfo (данные из Service-2)
+
+```json
+{
+    "clientId": "client-1",
+    "clientName": "Иван Иванов",
+    "activeRequests": [
+        {
+            "category": "LOAN",
+            "topic": "Досрочное погашение",
+            "status": "ACTIVE"
+        }
+    ]
+}
+```
+
+### ModerationResult (исходящее в topic-2)
+
+```json
+{
+    "eventId": "evt-123",
+    "clientId": "client-1",
+    "category": "LOAN",
+    "topic": "Досрочное погашение",
+    "status": "APPROVED",
+    "message": "Хочу погасить кредит досрочно"
+}
+```
+
+### ProcessedEvent (MongoDB)
+
+```json
+{
+    "_id": "ObjectId",
+    "eventId": "evt-123",
+    "clientId": "client-1",
+    "status": "APPROVED",
+    "rejectReason": null,
+    "processedAt": "2024-02-05T14:30:05"
+}
 ```
 
 ---
 
 ## Запуск
 
-### Сборка
+### 1. Запуск инфраструктуры
 
 ```bash
-cd uploadService && ./mvnw clean package -DskipTests && cd ..
-cd processingService && ./mvnw clean package -DskipTests && cd ..
+docker-compose up -d
 ```
 
-### Запуск через Docker Compose
+### 2. Запуск Service-2 (Data Service)
 
 ```bash
-docker-compose up --build -d
+cd service-2-data
+./mvnw spring-boot:run
 ```
 
-### Проверка
+### 3. Запуск Service-1 (Moderation Service)
 
 ```bash
-curl -X POST http://localhost:8081/api/v1/files/upload \
-  -H "X-Idempotency-Key: test-001" \
-  -F "file=@myfile.txt"
+cd service-1-moderation
+./mvnw spring-boot:run
 ```
 
-MinIO Console доступна по адресу http://localhost:9001 (логин: `admin`, пароль: `password`).
+---
 
+## Тестирование
+
+### Ручное тестирование (Postman/curl)
+
+**1. Создать клиента в Service-2:**
+
+```bash
+curl -X POST http://localhost:8082/api/clients \
+  -H "Content-Type: application/json" \
+  -d '{
+    "clientId": "client-1",
+    "clientName": "Тест Клиент",
+    "activeRequests": []
+  }'
+```
+
+**2. Отправить обращение на модерацию:**
+
+```bash
+curl -X POST http://localhost:8081/api/moderation/send \
+  -H "Content-Type: application/json" \
+  -d '{
+    "eventId": "evt-001",
+    "clientId": "client-1",
+    "category": "DEPOSIT",
+    "topic": "Консультация",
+    "message": "Вопрос по вкладу",
+    "timestamp": "2024-02-05T14:30:00"
+  }'
+```
+
+### Нагрузочное тестирование (k6)
+
+```bash
+k6 run k6-test.js
+```
+
+Сценарий:
+
+- Создание 10 тестовых клиентов (некоторые с активными обращениями)
+- Нагрузка 100 RPS в течение 1 минуты
+
+Пороги:
+
+- 95% запросов < 500мс
+- Ошибок < 5%
+- 99% отправок < 1с
+
+---
+
+## Гарантии
+
+| Свойство             | Механизм                                                    |
+|----------------------|-------------------------------------------------------------|
+| Идемпотентность      | Уникальный индекс `eventId` в MongoDB                       |
+| At-least-once delivery | Manual offset commit после успешной обработки              |
+| Отказоустойчивость   | Retry с экспоненциальной задержкой при вызове Service-2     |
+| Graceful degradation | Fallback на пустой `ClientInfo` при недоступности Service-2 |
