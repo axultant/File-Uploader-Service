@@ -5,16 +5,15 @@ spring:
   application:
     name: upload-service
 
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+
   r2dbc:
     url: r2dbc:postgresql://localhost:5432/file_db
     username: user
     password: password
-
-  flyway:
-    url: jdbc:postgresql://localhost:5432/file_db
-    user: user
-    password: password
-    enabled: true
 
   data:
     redis:
@@ -25,12 +24,10 @@ spring:
     bootstrap-servers: localhost:9092
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
-    properties:
-      spring.json.add.type.headers: false # Чтобы не было проблем с маппингом на стороне воркера
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
 
   codec:
-    max-in-memory-size:
+    max-in-memory-size: 512KB
 
 app:
   upload:

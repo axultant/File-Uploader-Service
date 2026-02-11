@@ -1,4 +1,4 @@
-package kaspi.lab.uploadService.dto;
+package kaspi.lab.uploadService.dto.response;
 
 import lombok.Builder;
 
@@ -8,9 +8,8 @@ import java.util.UUID;
 @Builder
 public record FileUploadResponse(
         UUID fileId,
-        String fileName,
+        String filename,
         String status,
         String message,
-        Instant timeStamp
-) {
-}
+        Instant timestamp
+) {}
